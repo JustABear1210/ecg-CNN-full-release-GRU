@@ -1034,16 +1034,14 @@ int main (void) {
 	}
 	XTime_GetTime(&HW_time_end);
 	u64 HW_cost_time = ((HW_time_end - HW_time_start) * 1000000ULL) / COUNTS_PER_SECOND;
-
+	printf("Total DMA_input cost time : %llu us\n", HW_cost_time);
 	printf("Total hardware cost time : %llu us\n", HW_cost_time);
 
 
 	average_tick = average_tick / repeat_time;
-	average_DMA = average_DMA / repeat_time;
 	u64 average_cost_time = (average_tick * 1000000ULL) / COUNTS_PER_SECOND;
-	u64 average_DMA_input_time = (average_DMA * 1000000ULL) / COUNTS_PER_SECOND;
 	printf("Average Cost time : %llu us\n", average_cost_time);
-	printf("Total DMA_input cost time : %llu us\n", average_DMA_input_time );
+
 	printf("Finish\n");
 	XTime_GetTime(&SW_time_start);
 	//ecg_lstm_and_gru();

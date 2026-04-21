@@ -974,7 +974,6 @@ int main (void) {
 
 	int repeat_time = 256;
 	u64 average_tick = 0;
-	u64 average_DMA = 0;
 	XTime HW_time_start, HW_time_end, SW_time_start, SW_time_end;
 	XTime_GetTime(&HW_time_start);
     int correct_gru = 0;
@@ -993,13 +992,11 @@ int main (void) {
 		*/
 		XTime t0, t1;
 		XTime_GetTime(&t0);
-		XTime DMA_time0, DMA_time1;
+
 		// reset and input data
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000004) ; // rst_sw = 1, data_in = 0, op_st = 0
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000002) ; // rst_sw = 0, data_in = 1, op_st = 0
-		XTime_GetTime(&DMA_time0);
 		MoveDataDMAS32(input, bram_input, 256);
-		XTime_GetTime(&DMA_time1);
 		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 8) == 0) { // slv_reg2 //wait conv1 (layer1) bias prepare ready
 
 
@@ -1019,9 +1016,7 @@ int main (void) {
 		XTime_GetTime(&t1);
 
 		u64 gticks1 = t1 - t0;
-		u64 dma_time = DMA_time1 - DMA_time0;
 		u64 us1     = (gticks1 * 1000000ULL) / COUNTS_PER_SECOND;
-		u64 us2     = (dma_time * 1000000ULL) / COUNTS_PER_SECOND;
 		/*
 		printf("Times of output data : %d . Cost Time : %llu us\n", i+1, us1);
 
@@ -1030,20 +1025,16 @@ int main (void) {
 		}
 		*/
 		average_tick = average_tick + gticks1;
-		average_DMA = average_DMA + dma_time;
 	}
 	XTime_GetTime(&HW_time_end);
 	u64 HW_cost_time = ((HW_time_end - HW_time_start) * 1000000ULL) / COUNTS_PER_SECOND;
-
 	printf("Total hardware cost time : %llu us\n", HW_cost_time);
 
 
 	average_tick = average_tick / repeat_time;
-	average_DMA = average_DMA / repeat_time;
 	u64 average_cost_time = (average_tick * 1000000ULL) / COUNTS_PER_SECOND;
-	u64 average_DMA_input_time = (average_DMA * 1000000ULL) / COUNTS_PER_SECOND;
 	printf("Average Cost time : %llu us\n", average_cost_time);
-	printf("Total DMA_input cost time : %llu us\n", average_DMA_input_time );
+
 	printf("Finish\n");
 	XTime_GetTime(&SW_time_start);
 	//ecg_lstm_and_gru();
