@@ -3,6 +3,7 @@
 	<name>2026_3_29_bsp</name>
 	<comment>Created by SDK v2018.2</comment>
 	<projects>
+		<project>design_1_wrapper_hw_platform_1</project>
 	</projects>
 	<buildSpec>
 		<buildCommand>

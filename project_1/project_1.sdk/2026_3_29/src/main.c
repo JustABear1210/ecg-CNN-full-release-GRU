@@ -1057,7 +1057,7 @@ int MoveDataDMAS32(s32 * source, s32 * destination, int num) {
 		CntValue1 = XScuTimer_GetCounterValue(TimerInstancePtr);
 
 		if (debug_flag)
-			print("Transfer complete\r\n");
+		//	print("Transfer complete\r\n");
 		// Disable the interrupt for the device
 		//XScuGic_Disable(&Gic, XPAR_XDMAPS_0_DONE_INTR_0);
 
@@ -1254,16 +1254,20 @@ int main (void) {
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000004) ; // rst_sw = 1, data_in = 0, op_st = 0
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000002) ; // rst_sw = 0, data_in = 1, op_st = 0
 		XTime_GetTime(&DMA_time0);
-		MoveDataDMAS32_withGRU(input, bram_input, 256, &gru);
+		//MoveDataDMAS32_withGRU(input, bram_input, 256, &gru);
+		MoveDataDMAS32(input, bram_input, 256);
 		XTime_GetTime(&DMA_time1);
 		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 8) == 0) { // slv_reg2 //wait conv1 (layer1) bias prepare ready
+			/*
 		    if (!gru.done) {
 		        gru_task_step(&gru);
 		    }
+		    */
 
 		}
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000001) ; // rst_sw = 0, data_in = 0, op_st = 1 // operation start
 		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 4) == 0) { // slv_reg1 // wait done
+			/*
 		    if (!gru.done) {
 		        gru_task_step(&gru);
 		    }
@@ -1277,11 +1281,13 @@ int main (void) {
 		}
 
 		// take output data
-		MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
-
+		//MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
+		MoveDataDMAS32(bram_output, output1, 1024);
+		/*
 	    while (!gru.done) {
 	        gru_task_step(&gru);
 	    }
+	    */
 		XTime_GetTime(&t1);
 	    int pred_gru = gru.pred;
 
