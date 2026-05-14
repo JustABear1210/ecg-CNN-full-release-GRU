@@ -3,6 +3,7 @@
 	<name>2026_5_8_bsp</name>
 	<comment>Created by SDK v2018.3</comment>
 	<projects>
+		<project>2026_3_29_bsp</project>
 	</projects>
 	<buildSpec>
 		<buildCommand>

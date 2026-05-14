@@ -14,8 +14,11 @@
 
 #include "xtime_l.h"
 #include "weights_gru.h"
+#include "rr_signal_1000_q6_s32.h"
 #include "rr_signal_1000.h"
 #include "rr_symbol_1000.h"
+#include "fc_weight_float.h"
+#include "feature_norm.h"
 #define RESET_LOOP_COUNT	10	// Number of times to check reset is done
 #define LENGTH 8192 // source and destination buffers lengths in number of words
 
@@ -848,6 +851,87 @@ void ecg_gru_MK3(int Sample_Position){
 //******************ecg GRU part******************
 
 
+//******************HW FC part********************
+int fc_classify_float(const float *conv_out)
+{
+    float score[FC_CLASS_NUM];
+
+    for (int c = 0; c < FC_CLASS_NUM; c++) {
+        score[c] = fc_bias[c];
+    }
+
+    for (int i = 0; i < FC_FEATURE_NUM; i++) {
+        for (int c = 0; c < FC_CLASS_NUM; c++) {
+            score[c] += conv_out[i] * fc_weight[i][c];
+        }
+    }
+
+    int class_id = 0;
+    float max_score = score[0];
+
+    for (int c = 1; c < FC_CLASS_NUM; c++) {
+        if (score[c] > max_score) {
+            max_score = score[c];
+            class_id = c;
+        }
+    }
+
+    return class_id;
+}
+
+int FC(s32 *conv_out_int)
+{
+    float conv_out_float[FC_FEATURE_NUM];
+
+    for (int i = 0; i < FC_FEATURE_NUM; i++) {
+        conv_out_float[i] =
+            ((float)conv_out_int[i] - feature_mean[i]) / feature_std[i];
+    }
+
+    return fc_classify_float(conv_out_float);
+}
+/*
+int fc_classify_float(const float *conv_out){
+
+    float score[FC_CLASS_NUM];
+
+    for (int c = 0; c < FC_CLASS_NUM; c++) {
+        score[c] = fc_bias[c];
+    }
+
+    for (int i = 0; i < FC_FEATURE_NUM; i++) {
+        for (int c = 0; c < FC_CLASS_NUM; c++) {
+            score[c] += conv_out[i] * fc_weight[i][c];
+        }
+    }
+
+    int class_id = 0;
+    float max_score = score[0];
+
+    for (int c = 1; c < FC_CLASS_NUM; c++) {
+        if (score[c] > max_score) {
+            max_score = score[c];
+            class_id = c;
+        }
+    }
+
+    return class_id;
+}
+
+
+int FC(s32 *conv_out_int){
+
+	float conv_out_float[1024];
+	for (int i = 0; i < 1024; i++) {
+	    conv_out_float[i] = (float)conv_out_int[i];
+	}
+
+	int pred = fc_classify_float(conv_out_float);
+	return pred;
+}
+*/
+//******************HW FC part********************
+
 
 
 
@@ -1010,6 +1094,13 @@ void gen_random_data(s32 *input, int gen_datanum)
     for (int i = 0; i < gen_datanum; i++)
     {
         input[i] = (rand() % 64) - 32;  // -32 ~ +31
+    }
+}
+
+void load_HW_input(s32 *input, int data_index)
+{
+    for (int i = 0; i < RR_SIGNAL_LEN; i++) {
+        input[i] = rr_signal_q6_s32[data_index][i];
     }
 }
 
@@ -1222,12 +1313,18 @@ int main (void) {
 	srand(10);	// seed
 
 	int repeat_time = 256;
+	int DMA_mult = 1;
 	u64 average_tick = 0;
 	u64 average_DMA = 0;
+	u64 total_DMA = 0;
+	u64 average_DMA_out = 0;
+	u64 total_DMA_out = 0;
 	XTime HW_time_start, HW_time_end, SW_time_start, SW_time_end;
 	XTime_GetTime(&HW_time_start);
     int correct_gru = 0;
+    int correct_conv = 0;
     int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
+    int cm_conv[NUM_CLASSES][NUM_CLASSES] = {{0}};
     
 	for ( int i = 0 ; i < repeat_time ; i++) {	//repeat time
 
@@ -1240,7 +1337,10 @@ int main (void) {
 
     	gru_task_init(&gru, x, yt);
     	//partial gru init
-		gen_random_data(input, 256);
+		//gen_random_data(input, 256);
+
+		load_HW_input(input, i);
+
 		/*
 		printf("Times of input data. %d\n", i+1);
 		for ( int i = 0 ; i < 256 ; i++ ) {
@@ -1249,13 +1349,17 @@ int main (void) {
 		*/
 		XTime t0, t1;
 		XTime_GetTime(&t0);
-		XTime DMA_time0, DMA_time1;
+		XTime DMA_time0, DMA_time1, DMA_time2, DMA_time3;
 		// reset and input data
+
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000004) ; // rst_sw = 1, data_in = 0, op_st = 0
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000002) ; // rst_sw = 0, data_in = 1, op_st = 0
 		XTime_GetTime(&DMA_time0);
 		//MoveDataDMAS32_withGRU(input, bram_input, 256, &gru);
-		MoveDataDMAS32(input, bram_input, 256);
+		for(int j = 0; j < DMA_mult;j++){
+			MoveDataDMAS32(input, bram_input, 256);
+		}
+
 		XTime_GetTime(&DMA_time1);
 		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 8) == 0) { // slv_reg2 //wait conv1 (layer1) bias prepare ready
 			/*
@@ -1281,13 +1385,18 @@ int main (void) {
 		}
 
 		// take output data
+		XTime_GetTime(&DMA_time2);
 		//MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
-		MoveDataDMAS32(bram_output, output1, 1024);
+		for(int j = 0; j < DMA_mult;j++){
+			MoveDataDMAS32(bram_output, output1, 1024);
+		}
+		XTime_GetTime(&DMA_time3);
 		/*
 	    while (!gru.done) {
 	        gru_task_step(&gru);
 	    }
 	    */
+
 		XTime_GetTime(&t1);
 	    int pred_gru = gru.pred;
 
@@ -1298,17 +1407,28 @@ int main (void) {
 	    cm_gru[yt][pred_gru] += 1;
 		u64 gticks1 = t1 - t0;
 		u64 dma_time = DMA_time1 - DMA_time0;
+		u64 dma_time2 = DMA_time3 - DMA_time2;
 		u64 us1     = (gticks1 * 1000000ULL) / COUNTS_PER_SECOND;
 		u64 us2     = (dma_time * 1000000ULL) / COUNTS_PER_SECOND;
-		/*
-		printf("Times of output data : %d . Cost Time : %llu us\n", i+1, us1);
+		u64 us3     = (dma_time2 * 1000000ULL) / COUNTS_PER_SECOND;
+/*
+		printf("Times of output data : %d .\n", i+1);
 
 		for ( int i = 0 ; i < 1024 ; i++) {
 			printf("%d\n", output1[i]);
 		}
-		*/
+*/
+
+		int pred_conv = 0;
+		pred_conv = FC(output1);
+	    if (pred_conv == yt) {
+	        correct_conv++;
+	    }
+
+	    cm_conv[yt][pred_conv] += 1;
 		average_tick = average_tick + gticks1;
-		average_DMA = average_DMA + dma_time;
+		total_DMA = total_DMA + dma_time;
+		total_DMA_out = total_DMA_out + dma_time2;
 	}
 	XTime_GetTime(&HW_time_end);
 	u64 HW_cost_time = ((HW_time_end - HW_time_start) * 1000000ULL) / COUNTS_PER_SECOND;
@@ -1317,11 +1437,19 @@ int main (void) {
 
 
 	average_tick = average_tick / repeat_time;
-	average_DMA = average_DMA / repeat_time;
+	average_DMA = total_DMA / repeat_time;
+	average_DMA_out = total_DMA_out / repeat_time;
 	u64 average_cost_time = (average_tick * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 average_DMA_input_time = (average_DMA * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 total_DMA_input_time = (total_DMA * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 average_DMA_output_time = (average_DMA_out * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 total_DMA_output_time = (total_DMA_out * 1000000ULL) / COUNTS_PER_SECOND;
 	printf("Average Cost time : %llu us\n", average_cost_time);
-	printf("Total DMA_input cost time : %llu us\n", average_DMA_input_time );
+	printf("DMA multiple : %d \n", DMA_mult );
+	printf("Average DMA_input cost time : %llu us\n", average_DMA_input_time );
+	printf("Total DMA_input cost time : %llu us\n", total_DMA_input_time );
+	printf("Average DMA_output cost time : %llu us\n", average_DMA_output_time );
+	printf("Total DMA_output cost time : %llu us\n", total_DMA_output_time );
 	printf("Finish\n");
 	XTime_GetTime(&SW_time_start);
 	//ecg_lstm_and_gru();
@@ -1332,17 +1460,18 @@ int main (void) {
 	u64 SW_cost_time = ((SW_time_end - SW_time_start) * 1000000ULL) / COUNTS_PER_SECOND;
 	printf("Total software cost time : %llu us\n", SW_cost_time);
     float acc_gru  = (float)correct_gru  / (float)repeat_time;
-
+    float acc_conv  = (float)correct_conv  / (float)repeat_time;
 
     // xil_printf doesn't support %f reliably on some BSPs.
     // Print as fixed-point (x10000) to be safe.
     int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
-
+    int acc_conv_x1e4  = (int)(acc_conv  * 10000.0f + 0.5f);
 
 
     printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
-
+    printf("conv acc : %d.%04d\n",  acc_conv_x1e4/10000,  acc_conv_x1e4%10000);
 
     print_confusion(cm_gru, "GRU");
+    print_confusion(cm_conv, "CONV");
     return 0;
 } // main()

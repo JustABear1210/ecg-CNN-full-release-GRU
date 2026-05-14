@@ -1,0 +1,1362 @@
+#include "xparameters.h"
+#include "stdio.h"
+#include "xil_exception.h"
+#include "unistd.h"
+
+#include "xuartps.h"	// if PS uart is used
+#include "xscutimer.h"  // if PS Timer is used
+#include "xdmaps.h"		// if PS DMA is used
+#include "xscugic.h" 	// if PS GIC is used
+#include "xil_exception.h"	// if interrupt is used
+#include "xil_printf.h"
+
+#include "stdlib.h"
+
+#include "xtime_l.h"
+#include "weights_gru.h"
+#include "rr_signal_1000.h"
+#include "rr_symbol_1000.h"
+#define RESET_LOOP_COUNT	10	// Number of times to check reset is done
+#define LENGTH 8192 // source and destination buffers lengths in number of words
+
+#define OCM_MEMORY XPAR_PS7_OCMC_0_S_AXI_BASEADDR
+#define BRAM_MEMORY0 XPAR_AXI_BRAM_CTRL_0_S_AXI_BASEADDR
+#define BRAM_MEMORY1 XPAR_AXI_BRAM_CTRL_1_S_AXI_BASEADDR
+#define DDR_MEMORY XPAR_PS7_DDR_0_S_AXI_BASEADDR+0x00020000 // pass all code and data sections
+
+#define TIMER_DEVICE_ID	XPAR_SCUTIMER_DEVICE_ID
+#define TIMER_LOAD_VALUE 0xFFFFFFFF
+#define DMA0_ID XPAR_XDMAPS_1_DEVICE_ID
+#define INTC_DEVICE_INT_ID XPAR_SCUGIC_SINGLE_DEVICE_ID
+
+
+// ecg defines
+#define T 8
+#define IN 32
+#define DIM (T*IN)
+
+#define GRU_H 128
+#define LSTM_H 128
+
+#define NUM_CLASSES 5
+// ecg defines
+
+volatile static int Done = 0;	/* Dma transfer is done */
+volatile static int Error = 0;	/* Dma Bus Error occurs */
+
+int debug_flag = 1;		// 1 to print debug message, 0 ffor silent mode (profiling)
+
+XUartPs Uart_PS;		/* Instance of the UART Device */
+XScuTimer Timer;		/* Cortex A9 SCU Private Timer Instance */
+XDmaPs Dma;				/* PS DMA */
+XScuGic Gic;			/* PS GIC */
+
+XScuTimer_Config *ConfigPtr;
+XScuTimer *TimerInstancePtr = &Timer;
+
+// PS Interrupt related definitions
+XScuGic_Config *GicConfig;
+
+XDmaPs_Config *DmaCfg;
+
+
+
+
+
+// ------------------------------------------------------------
+// Small math helpers (no extra .c/.h files)
+// ------------------------------------------------------------
+static inline float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+// exp approximation (used when USE_MATH_H=0)
+static inline float expf_approx(float x) {
+#if USE_MATH_H
+    return expf(x);
+#else
+    // Clamp to avoid overflow
+    x = clampf(x, -80.0f, 80.0f);
+
+    // e^x = 2^(x / ln2)
+    //const float inv_ln2 = 1.44269504088896341f; // 1/ln(2)
+    //const float ln2     = 0.6931471805599453f;
+    const float inv_ln2 = 1.442695f; // 1/ln(2)
+    const float ln2     = 0.693147f;
+
+    float y = x * inv_ln2;
+    int n = (int)(y);
+    float f = y - (float)n;
+
+
+    float p = 1.0f
+            + f * ln2
+            + (f*f) * (ln2*ln2*0.5f)
+            + (f*f*f) * (ln2*ln2*ln2*(1.0f/6.0f));
+
+    // scale by 2^n using exponent bits
+    int exp = n + 127;
+    if (exp <= 0) return 0.0f;
+    if (exp >= 255) return 3.402823466e+38f; // FLT_MAX
+    union { uint32_t i; float f; } u;
+    u.i = (uint32_t)(exp << 23);
+    return u.f * p;
+#endif
+}
+
+static inline float sigmoidf(float x) {
+    x = clampf(x, -20.0f, 20.0f);
+#if USE_MATH_H
+    return 1.0f / (1.0f + expf(-x));
+#else
+    float e = expf_approx(-x);
+    return 1.0f / (1.0f + e);
+#endif
+}
+
+static inline float tanhf_approx(float x) {
+#if USE_MATH_H
+    return tanhf(x);
+#else
+    // tanh(x) = 2*sigmoid(2x) - 1
+    float s = sigmoidf(2.0f * x);
+    return 2.0f * s - 1.0f;
+#endif
+}
+
+static inline float tanhf_approx_fast(float x) {
+    if (x <= -3.0f) return -1.0f;
+    if (x >=  3.0f) return  1.0f;
+
+    if (x < -1.0f) {
+        return 0.25f * x - 0.25f;
+    } else if (x < 1.0f) {
+        return x;
+    } else {
+        return 0.25f * x + 0.25f;
+    }
+}
+
+static inline float sigmoidf_approx_fast(float x) {
+    if (x <= -4.0f) return 0.0f;
+    if (x >=  4.0f) return 1.0f;
+
+    if (x < -1.0f) {
+        return 0.05f * x + 0.2f;
+    } else if (x < 1.0f) {
+        return 0.25f * x + 0.5f;
+    } else {
+        return 0.05f * x + 0.8f;
+    }
+}
+
+static void softmax5(const float logits[NUM_CLASSES], float prob[NUM_CLASSES]) {
+    float m = logits[0];
+    for (int i = 1; i < NUM_CLASSES; ++i) if (logits[i] > m) m = logits[i];
+
+    float sum = 0.0f;
+    for (int i = 0; i < NUM_CLASSES; ++i) {
+        float e = expf_approx(logits[i] - m);
+        prob[i] = e;
+        sum += e;
+    }
+    if (sum <= 0.0f) {
+        for (int i = 0; i < NUM_CLASSES; ++i) prob[i] = 1.0f / (float)NUM_CLASSES;
+        return;
+    }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < NUM_CLASSES; ++i) prob[i] *= inv;
+}
+
+static int argmax5(const float prob[NUM_CLASSES]) {
+    int best = 0;
+    float m = prob[0];
+    for (int i = 1; i < NUM_CLASSES; ++i) {
+        if (prob[i] > m) { m = prob[i]; best = i; }
+    }
+    return best;
+}
+
+
+
+// ------------------------------------------------------------
+// Small math helpers (no extra .c/.h files)
+// ------------------------------------------------------------
+
+
+
+
+//******************ecg GRU part******************
+
+//partial gru
+#define GRU_U_CHUNK 4
+
+typedef enum {
+    GRU_PHASE_ZR = 0,
+    GRU_PHASE_HTILDE,
+    GRU_PHASE_UPDATE,
+    GRU_PHASE_DENSE,
+    GRU_PHASE_DONE
+} GruPhase;
+
+typedef struct {
+    const float *x;
+    int yt;
+
+    int t;
+    int u;
+    int j;
+
+    GruPhase phase;
+
+    float h[GRU_H];
+    float z[GRU_H];
+    float r[GRU_H];
+    float h_tilde[GRU_H];
+    float logits[NUM_CLASSES];
+
+    int pred;
+    int done;
+} GruTask;
+
+static void gru_task_init(GruTask *g, const float *x, int yt)
+{
+    g->x = x;
+    g->yt = yt;
+
+    g->t = 0;
+    g->u = 0;
+    g->j = 0;
+
+    g->phase = GRU_PHASE_ZR;
+    g->pred = 0;
+    g->done = 0;
+
+    for (int i = 0; i < GRU_H; ++i) {
+        g->h[i] = 0.0f;
+        g->z[i] = 0.0f;
+        g->r[i] = 0.0f;
+        g->h_tilde[i] = 0.0f;
+    }
+
+    for (int i = 0; i < NUM_CLASSES; ++i) {
+        g->logits[i] = 0.0f;
+    }
+}
+
+
+static int gru_task_step(GruTask *g)
+{
+    if (g->done) return 1;
+
+    if (g->phase == GRU_PHASE_ZR) {
+
+        int u_end = g->u + GRU_U_CHUNK;
+        if (u_end > GRU_H) u_end = GRU_H;
+
+        const float *xt = g->x + g->t * IN;
+
+        for (int u = g->u; u < u_end; ++u) {
+            float zpre = gru_bias[u];
+            float rpre = gru_bias[GRU_H + u];
+
+            for (int k = 0; k < IN; ++k) {
+                float xv = xt[k];
+                zpre += xv * gru_kernel[k][u];
+                rpre += xv * gru_kernel[k][GRU_H + u];
+            }
+
+            float hz = 0.0f;
+            float hr = 0.0f;
+
+            for (int k = 0; k < GRU_H; ++k) {
+                float hv = g->h[k];
+                hz += hv * gru_recurrent_kernel[k][u];
+                hr += hv * gru_recurrent_kernel[k][GRU_H + u];
+            }
+
+            g->z[u] = sigmoidf_approx_fast(zpre + hz);
+            g->r[u] = sigmoidf_approx_fast(rpre + hr);
+        }
+
+        g->u = u_end;
+
+        if (g->u >= GRU_H) {
+            g->u = 0;
+            g->phase = GRU_PHASE_HTILDE;
+        }
+
+        return 0;
+    }
+
+    else if (g->phase == GRU_PHASE_HTILDE) {
+
+        int u_end = g->u + GRU_U_CHUNK;
+        if (u_end > GRU_H) u_end = GRU_H;
+
+        const float *xt = g->x + g->t * IN;
+
+        for (int u = g->u; u < u_end; ++u) {
+            float hpre = gru_bias[2 * GRU_H + u];
+
+            for (int k = 0; k < IN; ++k) {
+                float xv = xt[k];
+                hpre += xv * gru_kernel[k][2 * GRU_H + u];
+            }
+
+            float hh = 0.0f;
+
+            for (int k = 0; k < GRU_H; ++k) {
+                float hv = g->h[k] * g->r[k];
+                hh += hv * gru_recurrent_kernel[k][2 * GRU_H + u];
+            }
+
+            g->h_tilde[u] = tanhf_approx_fast(hpre + hh);
+        }
+
+        g->u = u_end;
+
+        if (g->u >= GRU_H) {
+            g->u = 0;
+            g->phase = GRU_PHASE_UPDATE;
+        }
+
+        return 0;
+    }
+
+    else if (g->phase == GRU_PHASE_UPDATE) {
+
+        int u_end = g->u + GRU_U_CHUNK;
+        if (u_end > GRU_H) u_end = GRU_H;
+
+        for (int u = g->u; u < u_end; ++u) {
+            float zu = g->z[u];
+            g->h[u] = zu * g->h[u] + (1.0f - zu) * g->h_tilde[u];
+        }
+
+        g->u = u_end;
+
+        if (g->u >= GRU_H) {
+            g->u = 0;
+            g->t++;
+
+            if (g->t >= T) {
+                g->phase = GRU_PHASE_DENSE;
+                g->j = 0;
+            } else {
+                g->phase = GRU_PHASE_ZR;
+            }
+        }
+
+        return 0;
+    }
+
+    else if (g->phase == GRU_PHASE_DENSE) {
+
+        if (g->j < NUM_CLASSES) {
+            float acc = gru_dense_b[g->j];
+
+            for (int i = 0; i < GRU_H; ++i) {
+                acc += g->h[i] * gru_dense_W[i][g->j];
+            }
+
+            g->logits[g->j] = acc;
+            g->j++;
+
+            return 0;
+        }
+
+        g->pred = argmax5(g->logits);
+        g->done = 1;
+        g->phase = GRU_PHASE_DONE;
+
+        return 1;
+    }
+
+    return g->done;
+}
+
+//****************partial gru ****************
+
+static void ecg_gru(const float *x256, float out_prob[NUM_CLASSES]) {
+    float h[GRU_H] = {0};
+
+    for (int t = 0; t < T; ++t) {
+        float z[GRU_H];
+        float r[GRU_H];
+
+        // 1) gates z and r
+        for (int u = 0; u < GRU_H; ++u) {
+            float zpre = gru_bias[u];
+            float rpre = gru_bias[GRU_H + u];
+
+            const float *xt = x256 + t*IN;
+            for (int k = 0; k < IN; ++k) {
+                float xv = xt[k];
+                zpre += xv * gru_kernel[k][u];
+                rpre += xv * gru_kernel[k][GRU_H + u];
+            }
+
+            float hz = 0.0f, hr = 0.0f;
+            for (int k = 0; k < GRU_H; ++k) {
+                float hv = h[k];
+                hz += hv * gru_recurrent_kernel[k][u];
+                hr += hv * gru_recurrent_kernel[k][GRU_H + u];
+            }
+
+            z[u] = sigmoidf(zpre + hz);
+            r[u] = sigmoidf(rpre + hr);
+        }
+
+        // 2) candidate h_tilde
+        float h_tilde[GRU_H];
+        for (int u = 0; u < GRU_H; ++u) {
+            float hpre = gru_bias[2*GRU_H + u];
+
+            const float *xt = x256 + t*IN;
+            for (int k = 0; k < IN; ++k) {
+                float xv = xt[k];
+                hpre += xv * gru_kernel[k][2*GRU_H + u];
+            }
+
+            float hh = 0.0f;
+            for (int k = 0; k < GRU_H; ++k) {
+                float hv = h[k] * r[k];
+                hh += hv * gru_recurrent_kernel[k][2*GRU_H + u];
+            }
+
+            h_tilde[u] = tanhf_approx(hpre + hh);
+        }
+
+        // 3) update h
+        for (int u = 0; u < GRU_H; ++u) {
+            float zu = z[u];
+            h[u] = zu * h[u] + (1.0f - zu) * h_tilde[u];
+        }
+    }
+
+    // Dense(128->5) + softmax
+    float logits[NUM_CLASSES];
+    for (int j = 0; j < NUM_CLASSES; ++j) {
+        float acc = gru_dense_b[j];
+        for (int i = 0; i < GRU_H; ++i) acc += h[i] * gru_dense_W[i][j];
+        logits[j] = acc;
+    }
+    softmax5(logits, out_prob);
+}
+
+
+
+
+
+
+static void print_confusion(const int cm[NUM_CLASSES][NUM_CLASSES], const char *title) {
+
+    printf("\n%s confusion matrix:\n", title);
+    for (int i = 0; i < NUM_CLASSES; ++i) {
+        printf(" [");
+        for (int j = 0; j < NUM_CLASSES; ++j) {
+            printf("%6d", cm[i][j]);
+            if (j != NUM_CLASSES-1) printf(" ");
+        }
+        printf("]\n");
+    }
+}
+
+
+
+void ecg_lstm_and_gru() {
+
+    int correct_gru = 0;
+    int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
+
+    XTime start_gru, end_gru;
+    XTime start_para_time, start_argmax_time;
+    XTime end_para_time, end_argmax_time;
+    u64 t_gru = 0;
+    u64 t_para = 0;
+    u64 t_argmax = 0;
+
+    int samples_count = 256;
+
+    // *********** GRU loop ************
+    printf("start GRU\n");
+    XTime_GetTime(&start_gru);
+    for (int n = 0; n < samples_count; ++n) {
+
+        XTime_GetTime(&start_para_time);
+        const float *x = rr_signal[n];  // 256 floats
+        int yt = (int)rr_label[n];      // 0..4
+        float p_gru[NUM_CLASSES];
+
+        //XTime_GetTime(&end_para_time);
+
+
+        //XTime_GetTime(&start_gru);
+        ecg_gru(x, p_gru);
+        //XTime_GetTime(&end_gru);
+
+        //XTime_GetTime(&start_argmax_time);
+        int pred_gru  = argmax5(p_gru);
+        //XTime_GetTime(&end_argmax_time);
+
+
+        if (pred_gru == yt) correct_gru++;
+
+        cm_gru[yt][pred_gru]  += 1;
+
+
+        // Optional progress print (reduce if UART is slow)
+        /*
+        if ((n % 200) == 0) {
+            printf("n=%d/%d\r", n, RR_N);
+
+        }
+        */
+       t_gru = t_gru + (end_gru - start_gru);
+       t_para = t_para + (end_para_time - start_para_time);
+       t_argmax = t_argmax + (end_argmax_time - start_argmax_time);
+    }
+    //XTime_GetTime(&end_gru);
+    //t_gru = (end_gru - start_gru);
+    printf("parameter setting time: %llu \n", t_para);
+    printf("parameter setting seconds=%.6f\r\n", (double)t_para / (double)COUNTS_PER_SECOND);
+    printf("gru time: %llu \n", t_gru);
+    printf("GRU seconds=%.6f\r\n", (double)t_gru / (double)COUNTS_PER_SECOND);
+    printf("argmax time: %llu \n", t_argmax);
+    printf("argmax seconds=%.6f\r\n", (double)t_argmax / (double)COUNTS_PER_SECOND);
+    // *********** GRU loop ************
+
+
+
+    printf("\n");
+
+    float acc_gru  = (float)correct_gru  / (float)samples_count;
+
+
+    // xil_printf doesn't support %f reliably on some BSPs.
+    // Print as fixed-point (x10000) to be safe.
+    int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
+
+
+
+    printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
+
+
+    //print_confusion(cm_gru, "GRU");
+
+
+}
+
+void ecg_gru_MK2(){
+
+    int correct_gru = 0;
+    int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
+/*
+    XTime start_gru, end_gru;
+    XTime start_para_time, start_argmax_time;
+    XTime end_para_time, end_argmax_time;
+    u64 t_gru = 0;
+    u64 t_para = 0;
+    u64 t_argmax = 0;
+*/
+    int samples_count = 256;
+
+    // *********** GRU loop ************
+    printf("start GRU\n");
+    //XTime_GetTime(&start_gru);
+    for (int n = 0; n < samples_count; ++n) {
+
+
+        const float *x = rr_signal[n];  // 256 floats
+        int yt = (int)rr_label[n];      // 0..4
+        float p_gru[NUM_CLASSES];
+
+		// here is gru repeat
+		float h[GRU_H] = {0};
+
+		for (int t = 0; t < T; ++t) {
+			float z[GRU_H];
+			float r[GRU_H];
+
+			// 1) gates z and r
+			for (int u = 0; u < GRU_H; ++u) {
+				float zpre = gru_bias[u];
+				float rpre = gru_bias[GRU_H + u];
+
+				const float *xt = x + t*IN;
+				for (int k = 0; k < IN; ++k) {
+					float xv = xt[k];
+					zpre += xv * gru_kernel[k][u];
+					rpre += xv * gru_kernel[k][GRU_H + u];
+				}
+
+				float hz = 0.0f, hr = 0.0f;
+				for (int k = 0; k < GRU_H; ++k) {
+					float hv = h[k];
+					hz += hv * gru_recurrent_kernel[k][u];
+					hr += hv * gru_recurrent_kernel[k][GRU_H + u];
+				}
+
+				z[u] = sigmoidf_approx_fast(zpre + hz);
+				r[u] = sigmoidf_approx_fast(rpre + hr);
+			}
+
+			// 2) candidate h_tilde
+			float h_tilde[GRU_H];
+			for (int u = 0; u < GRU_H; ++u) {
+				float hpre = gru_bias[2*GRU_H + u];
+
+				const float *xt = x + t*IN;
+				for (int k = 0; k < IN; ++k) {
+					float xv = xt[k];
+					hpre += xv * gru_kernel[k][2*GRU_H + u];
+				}
+
+				float hh = 0.0f;
+				for (int k = 0; k < GRU_H; ++k) {
+					float hv = h[k] * r[k];
+					hh += hv * gru_recurrent_kernel[k][2*GRU_H + u];
+				}
+
+				h_tilde[u] = tanhf_approx_fast(hpre + hh);
+			}
+
+			// 3) update h
+			for (int u = 0; u < GRU_H; ++u) {
+				float zu = z[u];
+				h[u] = zu * h[u] + (1.0f - zu) * h_tilde[u];
+			}
+		}
+
+		// Dense(128->5) + softmax
+		float logits[NUM_CLASSES];
+		for (int j = 0; j < NUM_CLASSES; ++j) {
+			float acc = gru_dense_b[j];
+			for (int i = 0; i < GRU_H; ++i) acc += h[i] * gru_dense_W[i][j];
+			logits[j] = acc;
+		}
+		//softmax5(logits, p_gru);
+		// end of gru repeat
+        //ecg_gru(x, p_gru);
+
+        int pred_gru  = argmax5(logits);
+
+
+
+        if (pred_gru == yt) correct_gru++;
+
+        cm_gru[yt][pred_gru]  += 1;
+
+
+        // Optional progress print (reduce if UART is slow)
+        /*
+        if ((n % 200) == 0) {
+            printf("n=%d/%d\r", n, RR_N);
+
+        }
+        */
+        /*
+       t_gru = t_gru + (end_gru - start_gru);
+       t_para = t_para + (end_para_time - start_para_time);
+       t_argmax = t_argmax + (end_argmax_time - start_argmax_time);
+       */
+    }
+    //XTime_GetTime(&end_gru);
+    //t_gru = (end_gru - start_gru);
+    /*
+    printf("parameter setting time: %llu \n", t_para);
+    printf("parameter setting seconds=%.6f\r\n", (double)t_para / (double)COUNTS_PER_SECOND);
+    printf("gru time: %llu \n", t_gru);
+    printf("GRU seconds=%.6f\r\n", (double)t_gru / (double)COUNTS_PER_SECOND);
+    printf("argmax time: %llu \n", t_argmax);
+    printf("argmax seconds=%.6f\r\n", (double)t_argmax / (double)COUNTS_PER_SECOND);
+    */
+    // *********** GRU loop ************
+
+
+
+    //printf("\n");
+
+    float acc_gru  = (float)correct_gru  / (float)samples_count;
+
+
+    // xil_printf doesn't support %f reliably on some BSPs.
+    // Print as fixed-point (x10000) to be safe.
+    int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
+
+
+
+    printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
+
+
+    //print_confusion(cm_gru, "GRU");
+
+}
+
+
+
+
+void ecg_gru_MK3(int Sample_Position){
+
+    int correct_gru = 0;
+    int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
+/*
+    XTime start_gru, end_gru;
+    XTime start_para_time, start_argmax_time;
+    XTime end_para_time, end_argmax_time;
+    u64 t_gru = 0;
+    u64 t_para = 0;
+    u64 t_argmax = 0;
+*/
+    int samples_count = 256;
+
+    // *********** GRU loop ************
+    printf("start GRU\n");
+    //XTime_GetTime(&start_gru);
+
+
+
+	const float *x = rr_signal[Sample_Position];  // 256 floats
+	int yt = (int)rr_label[Sample_Position];      // 0..4
+	float p_gru[NUM_CLASSES];
+
+	// here is gru repeat
+	float h[GRU_H] = {0};
+
+	for (int t = 0; t < T; ++t) {
+		float z[GRU_H];
+		float r[GRU_H];
+
+		// 1) gates z and r
+		for (int u = 0; u < GRU_H; ++u) {
+			float zpre = gru_bias[u];
+			float rpre = gru_bias[GRU_H + u];
+
+			const float *xt = x + t*IN;
+			for (int k = 0; k < IN; ++k) {
+				float xv = xt[k];
+				zpre += xv * gru_kernel[k][u];
+				rpre += xv * gru_kernel[k][GRU_H + u];
+			}
+
+			float hz = 0.0f, hr = 0.0f;
+			for (int k = 0; k < GRU_H; ++k) {
+				float hv = h[k];
+				hz += hv * gru_recurrent_kernel[k][u];
+				hr += hv * gru_recurrent_kernel[k][GRU_H + u];
+			}
+
+			z[u] = sigmoidf_approx_fast(zpre + hz);
+			r[u] = sigmoidf_approx_fast(rpre + hr);
+		}
+
+		// 2) candidate h_tilde
+		float h_tilde[GRU_H];
+		for (int u = 0; u < GRU_H; ++u) {
+			float hpre = gru_bias[2*GRU_H + u];
+
+			const float *xt = x + t*IN;
+			for (int k = 0; k < IN; ++k) {
+				float xv = xt[k];
+				hpre += xv * gru_kernel[k][2*GRU_H + u];
+			}
+
+			float hh = 0.0f;
+			for (int k = 0; k < GRU_H; ++k) {
+				float hv = h[k] * r[k];
+				hh += hv * gru_recurrent_kernel[k][2*GRU_H + u];
+			}
+
+			h_tilde[u] = tanhf_approx_fast(hpre + hh);
+		}
+
+		// 3) update h
+		for (int u = 0; u < GRU_H; ++u) {
+			float zu = z[u];
+			h[u] = zu * h[u] + (1.0f - zu) * h_tilde[u];
+		}
+	}
+
+	// Dense(128->5) + softmax
+	float logits[NUM_CLASSES];
+	for (int j = 0; j < NUM_CLASSES; ++j) {
+		float acc = gru_dense_b[j];
+		for (int i = 0; i < GRU_H; ++i) acc += h[i] * gru_dense_W[i][j];
+		logits[j] = acc;
+	}
+	//softmax5(logits, p_gru);
+	// end of gru repeat
+	//ecg_gru(x, p_gru);
+
+	int pred_gru  = argmax5(logits);
+
+
+
+	if (pred_gru == yt) correct_gru++;
+
+	cm_gru[yt][pred_gru]  += 1;
+
+
+	// Optional progress print (reduce if UART is slow)
+	/*
+	if ((n % 200) == 0) {
+		printf("n=%d/%d\r", n, RR_N);
+
+	}
+	*/
+	/*
+	t_gru = t_gru + (end_gru - start_gru);
+	t_para = t_para + (end_para_time - start_para_time);
+	t_argmax = t_argmax + (end_argmax_time - start_argmax_time);
+	*/
+
+    //XTime_GetTime(&end_gru);
+    //t_gru = (end_gru - start_gru);
+    /*
+    printf("parameter setting time: %llu \n", t_para);
+    printf("parameter setting seconds=%.6f\r\n", (double)t_para / (double)COUNTS_PER_SECOND);
+    printf("gru time: %llu \n", t_gru);
+    printf("GRU seconds=%.6f\r\n", (double)t_gru / (double)COUNTS_PER_SECOND);
+    printf("argmax time: %llu \n", t_argmax);
+    printf("argmax seconds=%.6f\r\n", (double)t_argmax / (double)COUNTS_PER_SECOND);
+    */
+    // *********** GRU loop ************
+
+
+
+    //printf("\n");
+
+    float acc_gru  = (float)correct_gru  / (float)samples_count;
+
+
+    // xil_printf doesn't support %f reliably on some BSPs.
+    // Print as fixed-point (x10000) to be safe.
+    int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
+
+
+
+    printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
+
+
+    //print_confusion(cm_gru, "GRU");
+
+}
+
+//******************ecg GRU part******************
+
+
+
+
+
+//int DmaPs_Start(XDmaPs *InstPtr, unsigned int Channel,
+//		  XDmaPs_Cmd *Cmd,
+//		  int HoldDmaProg);
+
+void DmaDoneHandler(unsigned int Channel,
+		    XDmaPs_Cmd *DmaCmd,
+		    void *CallbackRef)
+{
+	/* done handler */
+  	Done = 1;
+}
+
+void DmaFaultHandler(unsigned int Channel,
+		     XDmaPs_Cmd *DmaCmd,
+		     void *CallbackRef)
+{
+	/* fault handler */
+
+	Error = 1;
+}
+
+int SetupIntrSystem(XScuGic *GicPtr, XDmaPs *DmaPtr)
+{
+	int Status;
+
+	Xil_ExceptionInit();
+
+	// Connect the interrupt controller interrupt handler to the hardware
+	// interrupt handling logic in the processor.
+	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_IRQ_INT,
+			     (Xil_ExceptionHandler)XScuGic_InterruptHandler,
+			     GicPtr);
+
+	// Connect a device driver handler that will be called when an interrupt
+	// for the device occurs, the device driver handler performs the specific
+	// interrupt processing for the device
+
+	// Connect the Fault ISR
+	Status = XScuGic_Connect(GicPtr,
+				 XPAR_XDMAPS_0_FAULT_INTR,
+				 (Xil_InterruptHandler)XDmaPs_FaultISR,
+				 (void *)DmaPtr);
+	if (Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	// Connect the Done ISR for channel 0 of DMA 0
+	Status = XScuGic_Connect(GicPtr,
+				 XPAR_XDMAPS_0_DONE_INTR_0,
+				 (Xil_InterruptHandler)XDmaPs_DoneISR_0,
+				 (void *)DmaPtr);
+
+	if (Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	// Enable the interrupt for the device
+	XScuGic_Enable(GicPtr, XPAR_XDMAPS_0_DONE_INTR_0);
+
+	return XST_SUCCESS;
+}
+
+int MoveDataCPU(u32 * source, u32 * destination, int num) {
+	volatile u32 CntValue1;
+    int i;
+
+	// reset timer
+	XScuTimer_RestartTimer(TimerInstancePtr);
+
+	// start moving data through the processor - no CDMA, no interrupt
+	// gives base consumed cycles
+	for (i=0; i<num; i++)
+		*(destination+i) = *(source+i);
+
+	CntValue1 = XScuTimer_GetCounterValue(TimerInstancePtr);
+
+	return CntValue1;
+}
+
+
+
+int MoveDataDMA(u32 * source, u32 * destination, int num) {
+    int Status;
+	volatile u32 CntValue1;
+
+	// PS DMA related definitions
+
+	XDmaPs_Cmd DmaCmd = {
+		.ChanCtrl = {
+			.SrcBurstSize = 4,
+			.SrcBurstLen = 4,
+			.SrcInc = 1,		// increment source address
+			.DstBurstSize = 4,
+			.DstBurstLen = 4,
+			.DstInc = 1,		// increment destination address
+		},
+	};
+	unsigned int Channel = 0;
+
+
+	// Setup DMA Controller
+	DmaCfg = XDmaPs_LookupConfig(DMA0_ID);
+	if (!DmaCfg) {
+		xil_printf("Lookup DMAC %d failed\r\n", DMA0_ID);
+		return XST_FAILURE;
+	}
+
+	Status = XDmaPs_CfgInitialize(&Dma,DmaCfg,DmaCfg->BaseAddress);
+
+	if (Status) {
+		xil_printf("XDmaPs_CfgInitialize failed\r\n");
+		return XST_FAILURE;
+	}
+
+	// DMA in polling mode
+//		print("Starting transfer through DMA in poll mode\r\n");
+		DmaCmd.BD.SrcAddr = (u32)source;
+		DmaCmd.BD.DstAddr = (u32)destination;
+		DmaCmd.BD.Length = num * sizeof(int);
+
+	// setting up for interrupt driven DMA
+
+
+		if (debug_flag)
+			print("Setting up interrupt system\r\n");
+
+		Status = SetupIntrSystem(&Gic, &Dma);
+		if (Status != XST_SUCCESS) {
+			return XST_FAILURE;
+		}
+
+		Xil_ExceptionEnableMask(XIL_EXCEPTION_IRQ);
+
+		XDmaPs_SetDoneHandler(&Dma,0,DmaDoneHandler,0);
+		Status = XDmaPs_Start(&Dma, Channel, &DmaCmd, 0);	// release DMA buffer as we are done
+
+		// reset timer
+		XScuTimer_RestartTimer(TimerInstancePtr);
+
+		while ((Done==0) && (Error==0));
+
+		if (Error)
+			print("Error occurred during DMA transfer\r\n");
+
+		CntValue1 = XScuTimer_GetCounterValue(TimerInstancePtr);
+
+		if (debug_flag)
+			print("Transfer complete\r\n");
+		// Disable the interrupt for the device
+		XScuGic_Disable(&Gic, XPAR_XDMAPS_0_DONE_INTR_0);
+
+		Error = 0;
+		Done = 0;
+		return CntValue1;
+}
+
+void gen_random_data(s32 *input, int gen_datanum)
+{
+    for (int i = 0; i < gen_datanum; i++)
+    {
+        input[i] = (rand() % 64) - 32;  // -32 ~ +31
+    }
+}
+
+
+int MoveDataDMAS32(s32 * source, s32 * destination, int num) {
+    int Status;
+	volatile u32 CntValue1;
+
+	// PS DMA related definitions
+
+	XDmaPs_Cmd DmaCmd = {
+		.ChanCtrl = {
+			.SrcBurstSize = 4,
+			.SrcBurstLen = 4,
+			.SrcInc = 1,		// increment source address
+			.DstBurstSize = 4,
+			.DstBurstLen = 4,
+			.DstInc = 1,		// increment destination address
+		},
+	};
+	unsigned int Channel = 0;
+
+
+
+		DmaCmd.BD.SrcAddr = (s32)source;
+		DmaCmd.BD.DstAddr = (s32)destination;
+		DmaCmd.BD.Length = num * sizeof(int);
+
+	// setting up for interrupt driven DMA
+
+
+
+		Status = XDmaPs_Start(&Dma, Channel, &DmaCmd, 0);	// release DMA buffer as we are done
+
+		// reset timer
+		XScuTimer_RestartTimer(TimerInstancePtr);
+
+		while ((Done==0) && (Error==0)){
+
+		}
+
+		if (Error)
+			print("Error occurred during DMA transfer\r\n");
+
+		CntValue1 = XScuTimer_GetCounterValue(TimerInstancePtr);
+
+		if (debug_flag)
+		//	print("Transfer complete\r\n");
+		// Disable the interrupt for the device
+		//XScuGic_Disable(&Gic, XPAR_XDMAPS_0_DONE_INTR_0);
+
+		Error = 0;
+		Done = 0;
+		return CntValue1;
+}
+
+
+
+int MoveDataDMAS32_withGRU(s32 * source, s32 * destination, int num, GruTask *gru ) {
+    int Status;
+	volatile u32 CntValue1;
+
+	// PS DMA related definitions
+
+	XDmaPs_Cmd DmaCmd = {
+		.ChanCtrl = {
+			.SrcBurstSize = 4,
+			.SrcBurstLen = 4,
+			.SrcInc = 1,		// increment source address
+			.DstBurstSize = 4,
+			.DstBurstLen = 4,
+			.DstInc = 1,		// increment destination address
+		},
+	};
+	unsigned int Channel = 0;
+
+
+
+		DmaCmd.BD.SrcAddr = (s32)source;
+		DmaCmd.BD.DstAddr = (s32)destination;
+		DmaCmd.BD.Length = num * sizeof(int);
+
+	// setting up for interrupt driven DMA
+
+
+
+		Status = XDmaPs_Start(&Dma, Channel, &DmaCmd, 0);	// release DMA buffer as we are done
+
+		// reset timer
+		XScuTimer_RestartTimer(TimerInstancePtr);
+
+		while ((Done==0) && (Error==0)){
+	        if (!gru->done) {
+	            gru_task_step(gru);
+	        }
+		}
+
+		if (Error)
+			print("Error occurred during DMA transfer\r\n");
+
+		CntValue1 = XScuTimer_GetCounterValue(TimerInstancePtr);
+
+		if (debug_flag)
+		//	print("Transfer complete\r\n");
+		// Disable the interrupt for the device
+		//XScuGic_Disable(&Gic, XPAR_XDMAPS_0_DONE_INTR_0);
+
+		Error = 0;
+		Done = 0;
+		return CntValue1;
+}
+
+int main (void) {
+
+	int Status;
+
+	// UART related definitions
+
+	XUartPs_Config *Config;
+
+	// Initialize UART
+	// Look up the configuration in the config table, then initialize it.
+	Config = XUartPs_LookupConfig(XPAR_XUARTPS_0_DEVICE_ID);
+	if (NULL == Config) {
+		return XST_FAILURE;
+	}
+
+	Status = XUartPs_CfgInitialize(&Uart_PS, Config, Config->BaseAddress);
+	if (Status != XST_SUCCESS) {
+		return XST_FAILURE;
+	}
+
+	// Initialize timer counter
+	ConfigPtr = XScuTimer_LookupConfig(TIMER_DEVICE_ID);
+
+	Status = XScuTimer_CfgInitialize(TimerInstancePtr, ConfigPtr,
+				 ConfigPtr->BaseAddr);
+	if (Status != XST_SUCCESS) {
+		return XST_FAILURE;
+	}
+
+	// Initialize GIC
+	GicConfig = XScuGic_LookupConfig(INTC_DEVICE_INT_ID);
+	if (NULL == GicConfig) {
+		xil_printf("XScuGic_LookupConfig(%d) failed\r\n",
+				INTC_DEVICE_INT_ID);
+		return XST_FAILURE;
+	}
+
+	Status = XScuGic_CfgInitialize(&Gic, GicConfig,
+				       GicConfig->CpuBaseAddress);
+	if (Status != XST_SUCCESS) {
+		xil_printf("XScuGic_CfgInitialize failed\r\n");
+		return XST_FAILURE;
+	}
+
+	// Set options for timer/counter 0
+	// Load the timer counter register.
+	XScuTimer_LoadTimer(TimerInstancePtr, TIMER_LOAD_VALUE);
+
+	// Start the Scu Private Timer device.
+	XScuTimer_Start(TimerInstancePtr);
+
+
+
+	// Setup DMA Controller
+	if (debug_flag)
+		print("-- Memory Copy Performance test --\r\n");
+
+	DmaCfg = XDmaPs_LookupConfig(DMA0_ID);
+	if (!DmaCfg) {
+		xil_printf("Lookup DMAC %d failed\r\n", DMA0_ID);
+		return XST_FAILURE;
+	}
+
+	Status = XDmaPs_CfgInitialize(&Dma,DmaCfg,DmaCfg->BaseAddress);
+	if (Status) {
+		xil_printf("XDmaPs_CfgInitialize failed\r\n");
+		return XST_FAILURE;
+	}
+	// DMA in polling mode
+	if (debug_flag)
+		print("Setting up interrupt system\r\n");
+
+	Status = SetupIntrSystem(&Gic, &Dma);
+	if (Status != XST_SUCCESS) {
+		return XST_FAILURE;
+	}
+
+	Xil_ExceptionEnableMask(XIL_EXCEPTION_IRQ);
+
+	XDmaPs_SetDoneHandler(&Dma,0,DmaDoneHandler,0);
+
+
+
+
+
+	XDmaPs_SetFaultHandler(&Dma, DmaFaultHandler, 0);
+	// =================================================================
+
+	s32 *input, *output1; //
+	s32 *bram_input, *bram_output;
+	input = (s32 *) DDR_MEMORY + 0x00001000;
+	output1 = (s32 *) input + ( sizeof(s32) * 256 );
+
+	bram_input = (u32 *) BRAM_MEMORY0;
+	bram_output = (u32 *) BRAM_MEMORY1;
+
+	//prepare input data and bias
+	srand(10);	// seed
+
+	int repeat_time = 256;
+	u64 average_tick = 0;
+	u64 average_DMA = 0;
+	u64 average_DMA_out = 0;
+	XTime HW_time_start, HW_time_end, SW_time_start, SW_time_end;
+	XTime_GetTime(&HW_time_start);
+    int correct_gru = 0;
+    int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
+    
+	for ( int i = 0 ; i < repeat_time ; i++) {	//repeat time
+
+    	float p_gru[NUM_CLASSES];
+    	//partial gru init
+    	GruTask gru;
+
+    	const float *x = rr_signal[i];  // 256 floats
+    	int yt = (int)rr_label[i];      // 0..4
+
+    	gru_task_init(&gru, x, yt);
+    	//partial gru init
+		gen_random_data(input, 256);
+		/*
+		printf("Times of input data. %d\n", i+1);
+		for ( int i = 0 ; i < 256 ; i++ ) {
+			printf("%d\n", input[i]);
+		}
+		*/
+		XTime t0, t1;
+		XTime_GetTime(&t0);
+		XTime DMA_time0, DMA_time1, DMA_time2, DMA_time3;
+		// reset and input data
+		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000004) ; // rst_sw = 1, data_in = 0, op_st = 0
+		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000002) ; // rst_sw = 0, data_in = 1, op_st = 0
+		XTime_GetTime(&DMA_time0);
+		//MoveDataDMAS32_withGRU(input, bram_input, 256, &gru);
+		for(int j = 0; j < 2;j++){
+			MoveDataDMAS32(input, bram_input, 256);
+		}
+
+		XTime_GetTime(&DMA_time1);
+		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 8) == 0) { // slv_reg2 //wait conv1 (layer1) bias prepare ready
+			/*
+		    if (!gru.done) {
+		        gru_task_step(&gru);
+		    }
+		    */
+
+		}
+		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000001) ; // rst_sw = 0, data_in = 0, op_st = 1 // operation start
+		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 4) == 0) { // slv_reg1 // wait done
+			/*
+		    if (!gru.done) {
+		        gru_task_step(&gru);
+		    }
+			//printf("here is %d's data\n", i);
+			//ecg_gru(x, p_gru);
+			/*
+			int pred_gru  = argmax5(p_gru);
+			if (pred_gru == yt) correct_gru++;
+        	cm_gru[yt][pred_gru]  += 1;
+        	*/
+		}
+
+		// take output data
+		XTime_GetTime(&DMA_time2);
+		//MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
+		for(int j = 0; j < 2;j++){
+			MoveDataDMAS32(bram_output, output1, 1024);
+		}
+		XTime_GetTime(&DMA_time3);
+		/*
+	    while (!gru.done) {
+	        gru_task_step(&gru);
+	    }
+	    */
+		XTime_GetTime(&t1);
+	    int pred_gru = gru.pred;
+
+	    if (pred_gru == yt) {
+	        correct_gru++;
+	    }
+
+	    cm_gru[yt][pred_gru] += 1;
+		u64 gticks1 = t1 - t0;
+		u64 dma_time = DMA_time1 - DMA_time0;
+		u64 dma_time2 = DMA_time3 - DMA_time2;
+		u64 us1     = (gticks1 * 1000000ULL) / COUNTS_PER_SECOND;
+		u64 us2     = (dma_time * 1000000ULL) / COUNTS_PER_SECOND;
+		u64 us3     = (dma_time2 * 1000000ULL) / COUNTS_PER_SECOND;
+		/*
+		printf("Times of output data : %d . Cost Time : %llu us\n", i+1, us1);
+
+		for ( int i = 0 ; i < 1024 ; i++) {
+			printf("%d\n", output1[i]);
+		}
+		*/
+		average_tick = average_tick + gticks1;
+		average_DMA = average_DMA + dma_time;
+		average_DMA_out = average_DMA_out + dma_time2;
+	}
+	XTime_GetTime(&HW_time_end);
+	u64 HW_cost_time = ((HW_time_end - HW_time_start) * 1000000ULL) / COUNTS_PER_SECOND;
+
+	printf("Total hardware cost time : %llu us\n", HW_cost_time);
+
+
+	average_tick = average_tick / repeat_time;
+	average_DMA = average_DMA / repeat_time;
+	u64 average_cost_time = (average_tick * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 average_DMA_input_time = (average_DMA * 1000000ULL) / COUNTS_PER_SECOND;
+	printf("Average Cost time : %llu us\n", average_cost_time);
+	printf("Average DMA_input cost time : %llu us\n", average_DMA_input_time );
+	printf("Total DMA_input cost time : %llu us\n", average_DMA_input_time );
+	printf("Average DMA_output cost time : %llu us\n", average_DMA_input_time );
+	printf("Total DMA_output cost time : %llu us\n", average_DMA_input_time );
+	printf("Finish\n");
+	XTime_GetTime(&SW_time_start);
+	//ecg_lstm_and_gru();
+	//ecg_gru_MK2();
+	XTime_GetTime(&SW_time_end);
+
+
+	u64 SW_cost_time = ((SW_time_end - SW_time_start) * 1000000ULL) / COUNTS_PER_SECOND;
+	printf("Total software cost time : %llu us\n", SW_cost_time);
+    float acc_gru  = (float)correct_gru  / (float)repeat_time;
+
+
+    // xil_printf doesn't support %f reliably on some BSPs.
+    // Print as fixed-point (x10000) to be safe.
+    int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
+
+
+
+    printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
+
+
+    print_confusion(cm_gru, "GRU");
+    return 0;
+} // main()
