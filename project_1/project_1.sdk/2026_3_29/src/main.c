@@ -662,6 +662,8 @@ void load_HW_input(s32 *input, int data_index){
     }
 }
 
+
+
 void load_HW_inputMK2(s32 *input, int data_index){
 
 
@@ -670,6 +672,13 @@ void load_HW_inputMK2(s32 *input, int data_index){
 
 
 
+    }
+}
+
+void load_FC_input(s32 *FC_input, s32 *conv_output){
+
+    for (int i = 0; i < 1024; i++) {
+    	FC_input[i] = conv_output[i];
     }
 }
 
@@ -902,12 +911,13 @@ int main (void) {
 
 	s32 *input, *output1; //
 	s32 *bram_input, *bram_output;
+	s32 *FC_input;
 	input = (s32 *) DDR_MEMORY + 0x00001000;
 	output1 = (s32 *) input + ( sizeof(s32) * 256 );
-
+	FC_input = (s32 *) output1 + ( sizeof(s32) * 256 );
 	bram_input = (u32 *) BRAM_MEMORY0;
 	bram_output = (u32 *) BRAM_MEMORY1;
-
+	//s32 FC_input[1024];
 	//prepare input data and bias
 	srand(10);	// seed
 
@@ -916,10 +926,14 @@ int main (void) {
 	u64 average_tick = 0;
 	u64 average_DMA = 0;
 	u64 total_DMA = 0;
+	u64 average_SW = 0;
+	u64 total_SW = 0;
 	u64 average_DMA_out = 0;
 	u64 total_DMA_out = 0;
 	u64 average_FC = 0;
 	u64 total_FC = 0;
+	u64 average_HW = 0;
+	u64 total_HW = 0;
 	XTime HW_time_start, HW_time_end, SW_time_start, SW_time_end, FC_time_start, FC_time_end;
 	XTime_GetTime(&HW_time_start);
     int correct_gru = 0;
@@ -928,7 +942,7 @@ int main (void) {
     int cm_conv[NUM_CLASSES][NUM_CLASSES] = {{0}};
     float linear_output[5];
     float linear1_output[5];
-
+    int FC_done = 0;
     int correct_fc=0;
 	for ( int i = 0 ; i < repeat_time ; i++) {	//repeat time
 
@@ -941,8 +955,8 @@ int main (void) {
 
     	gru_task_init(&gru, x, yt);
     	//partial gru init
-		//gen_random_data(input, 256);
 
+    	FC_done = 0;
 		load_HW_input(input, i);
 
 		/*
@@ -961,9 +975,6 @@ int main (void) {
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000002) ; // rst_sw = 0, data_in = 1, op_st = 0
 		XTime_GetTime(&DMA_time0);
 
-		for ( int j = 0 ; j < 256 ; j++) {
-			//printf("%d\n", input[j]);
-		}
 
 		for(int j = 0; j < DMA_mult;j++){
 			//MoveDataDMAS32(input, bram_input, 256);
@@ -973,20 +984,30 @@ int main (void) {
 		XTime_GetTime(&DMA_time1);
 		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 8) == 0) { // slv_reg2 //wait conv1 (layer1) bias prepare ready
 
+
 		    if (!gru.done) {
 		        gru_task_step(&gru);
 		    }
-
 
 		}
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000001) ; // rst_sw = 0, data_in = 0, op_st = 1 // operation start
 		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 4) == 0) { // slv_reg1 // wait done
+			if(i != 0 && FC_done == 0){
+				FC(FC_input,linear1_output);
+				int pred_conv = Predicted(linear1_output);
+
+			    if (pred_conv == rr_label[i-1]) {
+			        correct_conv++;
+			    }
+
+			    cm_conv[rr_label[i-1]][pred_conv] += 1;
+				FC_done = 1;
+			}
 
 		    if (!gru.done) {
 		        gru_task_step(&gru);
 		    }
-			//printf("here is %d's data\n", i);
-			//ecg_gru(x, p_gru);
+
 		}
 
 		// take output data
@@ -997,12 +1018,13 @@ int main (void) {
 			MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
 		}
 		XTime_GetTime(&DMA_time3);
+		XTime_GetTime(&SW_time_start);
 
 	    while (!gru.done) {
 	        gru_task_step(&gru);
 	    }
 
-
+	    XTime_GetTime(&SW_time_end);
 		XTime_GetTime(&t1);
 
 	    int pred_gru = gru.pred;
@@ -1014,6 +1036,7 @@ int main (void) {
 		u64 gticks1 = t1 - t0;
 		u64 dma_time = DMA_time1 - DMA_time0;
 		u64 dma_time2 = DMA_time3 - DMA_time2;
+		u64 HW_time = DMA_time2 - DMA_time1;
 		u64 us1     = (gticks1 * 1000000ULL) / COUNTS_PER_SECOND;
 		u64 us2     = (dma_time * 1000000ULL) / COUNTS_PER_SECOND;
 		u64 us3     = (dma_time2 * 1000000ULL) / COUNTS_PER_SECOND;
@@ -1026,32 +1049,37 @@ int main (void) {
 
 */
 		XTime_GetTime(&FC_time_start);
-		int pred_conv = 0;
 
-		FC(output1,linear1_output);
+		load_FC_input(FC_input, output1);
+		//FC(FC_input,linear1_output);
+		/*
 		pred_conv = Predicted(linear1_output);
 
-	    if (pred_conv == rr_label[i]) {
+	    if (pred_conv == rr_label[i-1]) {
 	        correct_conv++;
 	    }
-
-	    cm_conv[yt][pred_conv] += 1;
+*/
+	    //cm_conv[yt][pred_conv] += 1;
 	    XTime_GetTime(&FC_time_end);
 	    total_FC = total_FC + (FC_time_end - FC_time_start);
+	    total_SW = total_SW + (SW_time_end - SW_time_start);
 		average_tick = average_tick + gticks1;
 		total_DMA = total_DMA + dma_time;
 		total_DMA_out = total_DMA_out + dma_time2;
+		total_HW = total_HW + HW_time;
 	}
 	XTime_GetTime(&HW_time_end);
 	u64 HW_cost_time = ((HW_time_end - HW_time_start) * 1000000ULL) / COUNTS_PER_SECOND;
 
-	printf("Total hardware cost time : %llu us\n", HW_cost_time);
+	printf("Total cost time : %llu us\n", HW_cost_time);
 
 
 	average_tick = average_tick / repeat_time;
 	average_DMA = total_DMA / repeat_time;
 	average_FC = total_FC / repeat_time;
 	average_DMA_out = total_DMA_out / repeat_time;
+	average_SW = total_SW / repeat_time;
+	average_HW = total_HW / repeat_time;
 	u64 average_cost_time = (average_tick * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 average_DMA_input_time = (average_DMA * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 total_DMA_input_time = (total_DMA * 1000000ULL) / COUNTS_PER_SECOND;
@@ -1059,7 +1087,11 @@ int main (void) {
 	u64 total_DMA_output_time = (total_DMA_out * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 average_FC_time = (average_FC * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 total_FC_time = (total_FC * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 average_HW_time = (average_HW * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 total_HW_time = (total_HW * 1000000ULL) / COUNTS_PER_SECOND;
 	printf("Average Cost time : %llu us\n", average_cost_time);
+	printf("Average HW cost time : %llu us\n", average_HW_time );
+	printf("Total HW cost time : %llu us\n", total_HW_time );
 	printf("DMA multiple : %d \n", DMA_mult );
 	printf("Average DMA_input cost time : %llu us\n", average_DMA_input_time );
 	printf("Total DMA_input cost time : %llu us\n", total_DMA_input_time );
@@ -1068,14 +1100,16 @@ int main (void) {
 	printf("Average FC cost time : %llu us\n", average_FC_time );
 	printf("Total FC cost time : %llu us\n", total_FC_time );
 	printf("Finish\n");
-	XTime_GetTime(&SW_time_start);
+	//XTime_GetTime(&SW_time_start);
 	//ecg_lstm_and_gru();
 	//ecg_gru_MK2();
-	XTime_GetTime(&SW_time_end);
+	//XTime_GetTime(&SW_time_end);
 
 
-	u64 SW_cost_time = ((SW_time_end - SW_time_start) * 1000000ULL) / COUNTS_PER_SECOND;
-	printf("Total software cost time : %llu us\n", SW_cost_time);
+	u64 total_SW_cost_time = (total_SW * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 average_SW_cost_time = (average_SW * 1000000ULL) / COUNTS_PER_SECOND;
+	printf("Total software cost time : %llu us\n", total_SW_cost_time);
+	printf("Average software cost time : %llu us\n", average_SW_cost_time );
     float acc_gru  = (float)correct_gru  / (float)repeat_time;
     float acc_conv  = (float)correct_conv  / (float)repeat_time;
 
