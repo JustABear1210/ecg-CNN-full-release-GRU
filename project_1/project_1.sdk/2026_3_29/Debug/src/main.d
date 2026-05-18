@@ -24,10 +24,9 @@ src/main.o src/main.o: ../src/main.c \
  ../../2026_3_29_bsp/ps7_cortexa9_0/include/xil_exception.h \
  ../../2026_3_29_bsp/ps7_cortexa9_0/include/xil_printf.h \
  ../../2026_3_29_bsp/ps7_cortexa9_0/include/xtime_l.h \
- ../src/weights_gru.h ../src/rr_signal_1000_q6_s32.h \
- ../../2026_3_29_bsp/ps7_cortexa9_0/include/xil_types.h \
- ../src/rr_signal_1000.h ../src/rr_symbol_1000.h ../src/fc_weight_float.h \
- ../src/feature_norm.h
+ ../src/weights_gru_64_for_task_step.h \
+ ../src/5class_signal_and_symbol_data_1000.h ../src/test_signal.h \
+ ../src/test_symbol.h ../src/fc_params_from_hw_features.h
 
 ../../2026_3_29_bsp/ps7_cortexa9_0/include/xparameters.h:
 
@@ -79,16 +78,12 @@ src/main.o src/main.o: ../src/main.c \
 
 ../../2026_3_29_bsp/ps7_cortexa9_0/include/xtime_l.h:
 
-../src/weights_gru.h:
+../src/weights_gru_64_for_task_step.h:
 
-../src/rr_signal_1000_q6_s32.h:
+../src/5class_signal_and_symbol_data_1000.h:
 
-../../2026_3_29_bsp/ps7_cortexa9_0/include/xil_types.h:
+../src/test_signal.h:
 
-../src/rr_signal_1000.h:
+../src/test_symbol.h:
 
-../src/rr_symbol_1000.h:
-
-../src/fc_weight_float.h:
-
-../src/feature_norm.h:
+../src/fc_params_from_hw_features.h:

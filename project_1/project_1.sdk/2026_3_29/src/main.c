@@ -13,12 +13,13 @@
 #include "stdlib.h"
 
 #include "xtime_l.h"
-#include "weights_gru.h"
-#include "rr_signal_1000_q6_s32.h"
-#include "rr_signal_1000.h"
-#include "rr_symbol_1000.h"
-#include "fc_weight_float.h"
-#include "feature_norm.h"
+
+#include "weights_gru_64_for_task_step.h"
+#include "5class_signal_and_symbol_data_1000.h"
+#include "test_signal.h"
+#include "test_symbol.h"
+//#include "fc_params.h"
+#include "fc_params_from_hw_features.h"
 #define RESET_LOOP_COUNT	10	// Number of times to check reset is done
 #define LENGTH 8192 // source and destination buffers lengths in number of words
 
@@ -38,7 +39,7 @@
 #define IN 32
 #define DIM (T*IN)
 
-#define GRU_H 128
+#define GRU_H 64
 #define LSTM_H 128
 
 #define NUM_CLASSES 5
@@ -470,466 +471,13 @@ static void print_confusion(const int cm[NUM_CLASSES][NUM_CLASSES], const char *
 
 
 
-void ecg_lstm_and_gru() {
-
-    int correct_gru = 0;
-    int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
-
-    XTime start_gru, end_gru;
-    XTime start_para_time, start_argmax_time;
-    XTime end_para_time, end_argmax_time;
-    u64 t_gru = 0;
-    u64 t_para = 0;
-    u64 t_argmax = 0;
-
-    int samples_count = 256;
-
-    // *********** GRU loop ************
-    printf("start GRU\n");
-    XTime_GetTime(&start_gru);
-    for (int n = 0; n < samples_count; ++n) {
-
-        XTime_GetTime(&start_para_time);
-        const float *x = rr_signal[n];  // 256 floats
-        int yt = (int)rr_label[n];      // 0..4
-        float p_gru[NUM_CLASSES];
-
-        //XTime_GetTime(&end_para_time);
-
-
-        //XTime_GetTime(&start_gru);
-        ecg_gru(x, p_gru);
-        //XTime_GetTime(&end_gru);
-
-        //XTime_GetTime(&start_argmax_time);
-        int pred_gru  = argmax5(p_gru);
-        //XTime_GetTime(&end_argmax_time);
-
-
-        if (pred_gru == yt) correct_gru++;
-
-        cm_gru[yt][pred_gru]  += 1;
-
-
-        // Optional progress print (reduce if UART is slow)
-        /*
-        if ((n % 200) == 0) {
-            printf("n=%d/%d\r", n, RR_N);
-
-        }
-        */
-       t_gru = t_gru + (end_gru - start_gru);
-       t_para = t_para + (end_para_time - start_para_time);
-       t_argmax = t_argmax + (end_argmax_time - start_argmax_time);
-    }
-    //XTime_GetTime(&end_gru);
-    //t_gru = (end_gru - start_gru);
-    printf("parameter setting time: %llu \n", t_para);
-    printf("parameter setting seconds=%.6f\r\n", (double)t_para / (double)COUNTS_PER_SECOND);
-    printf("gru time: %llu \n", t_gru);
-    printf("GRU seconds=%.6f\r\n", (double)t_gru / (double)COUNTS_PER_SECOND);
-    printf("argmax time: %llu \n", t_argmax);
-    printf("argmax seconds=%.6f\r\n", (double)t_argmax / (double)COUNTS_PER_SECOND);
-    // *********** GRU loop ************
-
-
-
-    printf("\n");
-
-    float acc_gru  = (float)correct_gru  / (float)samples_count;
-
-
-    // xil_printf doesn't support %f reliably on some BSPs.
-    // Print as fixed-point (x10000) to be safe.
-    int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
-
-
-
-    printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
-
-
-    //print_confusion(cm_gru, "GRU");
-
-
-}
-
-void ecg_gru_MK2(){
-
-    int correct_gru = 0;
-    int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
-/*
-    XTime start_gru, end_gru;
-    XTime start_para_time, start_argmax_time;
-    XTime end_para_time, end_argmax_time;
-    u64 t_gru = 0;
-    u64 t_para = 0;
-    u64 t_argmax = 0;
-*/
-    int samples_count = 256;
-
-    // *********** GRU loop ************
-    printf("start GRU\n");
-    //XTime_GetTime(&start_gru);
-    for (int n = 0; n < samples_count; ++n) {
-
-
-        const float *x = rr_signal[n];  // 256 floats
-        int yt = (int)rr_label[n];      // 0..4
-        float p_gru[NUM_CLASSES];
-
-		// here is gru repeat
-		float h[GRU_H] = {0};
-
-		for (int t = 0; t < T; ++t) {
-			float z[GRU_H];
-			float r[GRU_H];
-
-			// 1) gates z and r
-			for (int u = 0; u < GRU_H; ++u) {
-				float zpre = gru_bias[u];
-				float rpre = gru_bias[GRU_H + u];
-
-				const float *xt = x + t*IN;
-				for (int k = 0; k < IN; ++k) {
-					float xv = xt[k];
-					zpre += xv * gru_kernel[k][u];
-					rpre += xv * gru_kernel[k][GRU_H + u];
-				}
-
-				float hz = 0.0f, hr = 0.0f;
-				for (int k = 0; k < GRU_H; ++k) {
-					float hv = h[k];
-					hz += hv * gru_recurrent_kernel[k][u];
-					hr += hv * gru_recurrent_kernel[k][GRU_H + u];
-				}
-
-				z[u] = sigmoidf_approx_fast(zpre + hz);
-				r[u] = sigmoidf_approx_fast(rpre + hr);
-			}
-
-			// 2) candidate h_tilde
-			float h_tilde[GRU_H];
-			for (int u = 0; u < GRU_H; ++u) {
-				float hpre = gru_bias[2*GRU_H + u];
-
-				const float *xt = x + t*IN;
-				for (int k = 0; k < IN; ++k) {
-					float xv = xt[k];
-					hpre += xv * gru_kernel[k][2*GRU_H + u];
-				}
-
-				float hh = 0.0f;
-				for (int k = 0; k < GRU_H; ++k) {
-					float hv = h[k] * r[k];
-					hh += hv * gru_recurrent_kernel[k][2*GRU_H + u];
-				}
-
-				h_tilde[u] = tanhf_approx_fast(hpre + hh);
-			}
-
-			// 3) update h
-			for (int u = 0; u < GRU_H; ++u) {
-				float zu = z[u];
-				h[u] = zu * h[u] + (1.0f - zu) * h_tilde[u];
-			}
-		}
-
-		// Dense(128->5) + softmax
-		float logits[NUM_CLASSES];
-		for (int j = 0; j < NUM_CLASSES; ++j) {
-			float acc = gru_dense_b[j];
-			for (int i = 0; i < GRU_H; ++i) acc += h[i] * gru_dense_W[i][j];
-			logits[j] = acc;
-		}
-		//softmax5(logits, p_gru);
-		// end of gru repeat
-        //ecg_gru(x, p_gru);
-
-        int pred_gru  = argmax5(logits);
-
-
-
-        if (pred_gru == yt) correct_gru++;
-
-        cm_gru[yt][pred_gru]  += 1;
-
-
-        // Optional progress print (reduce if UART is slow)
-        /*
-        if ((n % 200) == 0) {
-            printf("n=%d/%d\r", n, RR_N);
-
-        }
-        */
-        /*
-       t_gru = t_gru + (end_gru - start_gru);
-       t_para = t_para + (end_para_time - start_para_time);
-       t_argmax = t_argmax + (end_argmax_time - start_argmax_time);
-       */
-    }
-    //XTime_GetTime(&end_gru);
-    //t_gru = (end_gru - start_gru);
-    /*
-    printf("parameter setting time: %llu \n", t_para);
-    printf("parameter setting seconds=%.6f\r\n", (double)t_para / (double)COUNTS_PER_SECOND);
-    printf("gru time: %llu \n", t_gru);
-    printf("GRU seconds=%.6f\r\n", (double)t_gru / (double)COUNTS_PER_SECOND);
-    printf("argmax time: %llu \n", t_argmax);
-    printf("argmax seconds=%.6f\r\n", (double)t_argmax / (double)COUNTS_PER_SECOND);
-    */
-    // *********** GRU loop ************
-
-
-
-    //printf("\n");
-
-    float acc_gru  = (float)correct_gru  / (float)samples_count;
-
-
-    // xil_printf doesn't support %f reliably on some BSPs.
-    // Print as fixed-point (x10000) to be safe.
-    int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
-
-
-
-    printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
-
-
-    //print_confusion(cm_gru, "GRU");
-
-}
-
-
-
-
-void ecg_gru_MK3(int Sample_Position){
-
-    int correct_gru = 0;
-    int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
-/*
-    XTime start_gru, end_gru;
-    XTime start_para_time, start_argmax_time;
-    XTime end_para_time, end_argmax_time;
-    u64 t_gru = 0;
-    u64 t_para = 0;
-    u64 t_argmax = 0;
-*/
-    int samples_count = 256;
-
-    // *********** GRU loop ************
-    printf("start GRU\n");
-    //XTime_GetTime(&start_gru);
-
-
-
-	const float *x = rr_signal[Sample_Position];  // 256 floats
-	int yt = (int)rr_label[Sample_Position];      // 0..4
-	float p_gru[NUM_CLASSES];
-
-	// here is gru repeat
-	float h[GRU_H] = {0};
-
-	for (int t = 0; t < T; ++t) {
-		float z[GRU_H];
-		float r[GRU_H];
-
-		// 1) gates z and r
-		for (int u = 0; u < GRU_H; ++u) {
-			float zpre = gru_bias[u];
-			float rpre = gru_bias[GRU_H + u];
-
-			const float *xt = x + t*IN;
-			for (int k = 0; k < IN; ++k) {
-				float xv = xt[k];
-				zpre += xv * gru_kernel[k][u];
-				rpre += xv * gru_kernel[k][GRU_H + u];
-			}
-
-			float hz = 0.0f, hr = 0.0f;
-			for (int k = 0; k < GRU_H; ++k) {
-				float hv = h[k];
-				hz += hv * gru_recurrent_kernel[k][u];
-				hr += hv * gru_recurrent_kernel[k][GRU_H + u];
-			}
-
-			z[u] = sigmoidf_approx_fast(zpre + hz);
-			r[u] = sigmoidf_approx_fast(rpre + hr);
-		}
-
-		// 2) candidate h_tilde
-		float h_tilde[GRU_H];
-		for (int u = 0; u < GRU_H; ++u) {
-			float hpre = gru_bias[2*GRU_H + u];
-
-			const float *xt = x + t*IN;
-			for (int k = 0; k < IN; ++k) {
-				float xv = xt[k];
-				hpre += xv * gru_kernel[k][2*GRU_H + u];
-			}
-
-			float hh = 0.0f;
-			for (int k = 0; k < GRU_H; ++k) {
-				float hv = h[k] * r[k];
-				hh += hv * gru_recurrent_kernel[k][2*GRU_H + u];
-			}
-
-			h_tilde[u] = tanhf_approx_fast(hpre + hh);
-		}
-
-		// 3) update h
-		for (int u = 0; u < GRU_H; ++u) {
-			float zu = z[u];
-			h[u] = zu * h[u] + (1.0f - zu) * h_tilde[u];
-		}
-	}
-
-	// Dense(128->5) + softmax
-	float logits[NUM_CLASSES];
-	for (int j = 0; j < NUM_CLASSES; ++j) {
-		float acc = gru_dense_b[j];
-		for (int i = 0; i < GRU_H; ++i) acc += h[i] * gru_dense_W[i][j];
-		logits[j] = acc;
-	}
-	//softmax5(logits, p_gru);
-	// end of gru repeat
-	//ecg_gru(x, p_gru);
-
-	int pred_gru  = argmax5(logits);
-
-
-
-	if (pred_gru == yt) correct_gru++;
-
-	cm_gru[yt][pred_gru]  += 1;
-
-
-	// Optional progress print (reduce if UART is slow)
-	/*
-	if ((n % 200) == 0) {
-		printf("n=%d/%d\r", n, RR_N);
-
-	}
-	*/
-	/*
-	t_gru = t_gru + (end_gru - start_gru);
-	t_para = t_para + (end_para_time - start_para_time);
-	t_argmax = t_argmax + (end_argmax_time - start_argmax_time);
-	*/
-
-    //XTime_GetTime(&end_gru);
-    //t_gru = (end_gru - start_gru);
-    /*
-    printf("parameter setting time: %llu \n", t_para);
-    printf("parameter setting seconds=%.6f\r\n", (double)t_para / (double)COUNTS_PER_SECOND);
-    printf("gru time: %llu \n", t_gru);
-    printf("GRU seconds=%.6f\r\n", (double)t_gru / (double)COUNTS_PER_SECOND);
-    printf("argmax time: %llu \n", t_argmax);
-    printf("argmax seconds=%.6f\r\n", (double)t_argmax / (double)COUNTS_PER_SECOND);
-    */
-    // *********** GRU loop ************
-
-
-
-    //printf("\n");
-
-    float acc_gru  = (float)correct_gru  / (float)samples_count;
-
-
-    // xil_printf doesn't support %f reliably on some BSPs.
-    // Print as fixed-point (x10000) to be safe.
-    int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
-
-
-
-    printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
-
-
-    //print_confusion(cm_gru, "GRU");
-
-}
 
 //******************ecg GRU part******************
 
 
 //******************HW FC part********************
-int fc_classify_float(const float *conv_out)
-{
-    float score[FC_CLASS_NUM];
-
-    for (int c = 0; c < FC_CLASS_NUM; c++) {
-        score[c] = fc_bias[c];
-    }
-
-    for (int i = 0; i < FC_FEATURE_NUM; i++) {
-        for (int c = 0; c < FC_CLASS_NUM; c++) {
-            score[c] += conv_out[i] * fc_weight[i][c];
-        }
-    }
-
-    int class_id = 0;
-    float max_score = score[0];
-
-    for (int c = 1; c < FC_CLASS_NUM; c++) {
-        if (score[c] > max_score) {
-            max_score = score[c];
-            class_id = c;
-        }
-    }
-
-    return class_id;
-}
-
-int FC(s32 *conv_out_int)
-{
-    float conv_out_float[FC_FEATURE_NUM];
-
-    for (int i = 0; i < FC_FEATURE_NUM; i++) {
-        conv_out_float[i] =
-            ((float)conv_out_int[i] - feature_mean[i]) / feature_std[i];
-    }
-
-    return fc_classify_float(conv_out_float);
-}
-/*
-int fc_classify_float(const float *conv_out){
-
-    float score[FC_CLASS_NUM];
-
-    for (int c = 0; c < FC_CLASS_NUM; c++) {
-        score[c] = fc_bias[c];
-    }
-
-    for (int i = 0; i < FC_FEATURE_NUM; i++) {
-        for (int c = 0; c < FC_CLASS_NUM; c++) {
-            score[c] += conv_out[i] * fc_weight[i][c];
-        }
-    }
-
-    int class_id = 0;
-    float max_score = score[0];
-
-    for (int c = 1; c < FC_CLASS_NUM; c++) {
-        if (score[c] > max_score) {
-            max_score = score[c];
-            class_id = c;
-        }
-    }
-
-    return class_id;
-}
 
 
-int FC(s32 *conv_out_int){
-
-	float conv_out_float[1024];
-	for (int i = 0; i < 1024; i++) {
-	    conv_out_float[i] = (float)conv_out_int[i];
-	}
-
-	int pred = fc_classify_float(conv_out_float);
-	return pred;
-}
-*/
 //******************HW FC part********************
 
 
@@ -1097,13 +645,33 @@ void gen_random_data(s32 *input, int gen_datanum)
     }
 }
 
-void load_HW_input(s32 *input, int data_index)
-{
-    for (int i = 0; i < RR_SIGNAL_LEN; i++) {
-        input[i] = rr_signal_q6_s32[data_index][i];
+void load_HW_input(s32 *input, int data_index){
+    float scaled = 0.0f;
+
+    for (int i = 0; i < TEST_SIGNAL_DIM1; i++) {
+    	scaled = test_signal[data_index][i] * 32.0f;
+        if (scaled >= 0.0f)
+        	input[i] = (int)(scaled + 0.5f);
+        else
+        	input[i] = (int)(scaled - 0.5f);
+
+        if (input[i] > 31)  input[i] = 31;
+        if (input[i] < -32) input[i] = -32;
+
+
     }
 }
 
+void load_HW_inputMK2(s32 *input, int data_index){
+
+
+    for (int i = 0; i < 256; i++) {
+    	input[i] = test_signal_1000[i + data_index * 256];
+
+
+
+    }
+}
 
 int MoveDataDMAS32(s32 * source, s32 * destination, int num) {
     int Status;
@@ -1213,6 +781,37 @@ int MoveDataDMAS32_withGRU(s32 * source, s32 * destination, int num, GruTask *gr
 		return CntValue1;
 }
 
+
+void FC(s32 *input, float *linear1_output) {
+
+  for ( int i = 0 ; i < 5 ; i++ ) {
+	  linear1_output[i] = 0.0 ;
+
+	for ( int j = 0 ; j < 1024 ; j++ ){
+		float temp = input[j] / 64.0f;
+		linear1_output[i] = linear1_output[i] + temp * fc_weight[i][j] ;
+	}
+
+	linear1_output[i] = linear1_output[i] + fc_bias[i] ;
+
+
+
+  } // for
+
+} // Dense()
+
+
+int Predicted(float *linear2_output){
+	int max = 0;
+	for ( int i = 1 ; i < 5 ; i++ ) {
+		if ( linear2_output[i] > linear2_output[max] ) {
+			max = i;
+		}
+	}
+
+	return max;
+}
+
 int main (void) {
 
 	int Status;
@@ -1312,27 +911,32 @@ int main (void) {
 	//prepare input data and bias
 	srand(10);	// seed
 
-	int repeat_time = 256;
+	int repeat_time = 500;
 	int DMA_mult = 1;
 	u64 average_tick = 0;
 	u64 average_DMA = 0;
 	u64 total_DMA = 0;
 	u64 average_DMA_out = 0;
 	u64 total_DMA_out = 0;
-	XTime HW_time_start, HW_time_end, SW_time_start, SW_time_end;
+	u64 average_FC = 0;
+	u64 total_FC = 0;
+	XTime HW_time_start, HW_time_end, SW_time_start, SW_time_end, FC_time_start, FC_time_end;
 	XTime_GetTime(&HW_time_start);
     int correct_gru = 0;
     int correct_conv = 0;
     int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
     int cm_conv[NUM_CLASSES][NUM_CLASSES] = {{0}};
-    
+    float linear_output[5];
+    float linear1_output[5];
+
+    int correct_fc=0;
 	for ( int i = 0 ; i < repeat_time ; i++) {	//repeat time
 
     	float p_gru[NUM_CLASSES];
     	//partial gru init
     	GruTask gru;
 
-    	const float *x = rr_signal[i];  // 256 floats
+    	const float *x = test_signal[i];  // 256 floats
     	int yt = (int)rr_label[i];      // 0..4
 
     	gru_task_init(&gru, x, yt);
@@ -1350,56 +954,58 @@ int main (void) {
 		XTime t0, t1;
 		XTime_GetTime(&t0);
 		XTime DMA_time0, DMA_time1, DMA_time2, DMA_time3;
+
 		// reset and input data
 
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000004) ; // rst_sw = 1, data_in = 0, op_st = 0
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000002) ; // rst_sw = 0, data_in = 1, op_st = 0
 		XTime_GetTime(&DMA_time0);
-		//MoveDataDMAS32_withGRU(input, bram_input, 256, &gru);
+
+		for ( int j = 0 ; j < 256 ; j++) {
+			//printf("%d\n", input[j]);
+		}
+
 		for(int j = 0; j < DMA_mult;j++){
-			MoveDataDMAS32(input, bram_input, 256);
+			//MoveDataDMAS32(input, bram_input, 256);
+			MoveDataDMAS32_withGRU(input, bram_input, 256, &gru);
 		}
 
 		XTime_GetTime(&DMA_time1);
 		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 8) == 0) { // slv_reg2 //wait conv1 (layer1) bias prepare ready
-			/*
+
 		    if (!gru.done) {
 		        gru_task_step(&gru);
 		    }
-		    */
+
 
 		}
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000001) ; // rst_sw = 0, data_in = 0, op_st = 1 // operation start
 		while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 4) == 0) { // slv_reg1 // wait done
-			/*
+
 		    if (!gru.done) {
 		        gru_task_step(&gru);
 		    }
 			//printf("here is %d's data\n", i);
 			//ecg_gru(x, p_gru);
-			/*
-			int pred_gru  = argmax5(p_gru);
-			if (pred_gru == yt) correct_gru++;
-        	cm_gru[yt][pred_gru]  += 1;
-        	*/
 		}
 
 		// take output data
 		XTime_GetTime(&DMA_time2);
-		//MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
+
 		for(int j = 0; j < DMA_mult;j++){
-			MoveDataDMAS32(bram_output, output1, 1024);
+			//MoveDataDMAS32(bram_output, output1, 1024);
+			MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
 		}
 		XTime_GetTime(&DMA_time3);
-		/*
+
 	    while (!gru.done) {
 	        gru_task_step(&gru);
 	    }
-	    */
+
 
 		XTime_GetTime(&t1);
-	    int pred_gru = gru.pred;
 
+	    int pred_gru = gru.pred;
 	    if (pred_gru == yt) {
 	        correct_gru++;
 	    }
@@ -1412,20 +1018,26 @@ int main (void) {
 		u64 us2     = (dma_time * 1000000ULL) / COUNTS_PER_SECOND;
 		u64 us3     = (dma_time2 * 1000000ULL) / COUNTS_PER_SECOND;
 /*
-		printf("Times of output data : %d .\n", i+1);
+		printf("output data : %d :\n", i+1);
 
-		for ( int i = 0 ; i < 1024 ; i++) {
-			printf("%d\n", output1[i]);
+		for ( int j = 0 ; j < 1024 ; j++) {
+			printf("%d\n", output1[j]);
 		}
-*/
 
+*/
+		XTime_GetTime(&FC_time_start);
 		int pred_conv = 0;
-		pred_conv = FC(output1);
-	    if (pred_conv == yt) {
+
+		FC(output1,linear1_output);
+		pred_conv = Predicted(linear1_output);
+
+	    if (pred_conv == rr_label[i]) {
 	        correct_conv++;
 	    }
 
 	    cm_conv[yt][pred_conv] += 1;
+	    XTime_GetTime(&FC_time_end);
+	    total_FC = total_FC + (FC_time_end - FC_time_start);
 		average_tick = average_tick + gticks1;
 		total_DMA = total_DMA + dma_time;
 		total_DMA_out = total_DMA_out + dma_time2;
@@ -1438,18 +1050,23 @@ int main (void) {
 
 	average_tick = average_tick / repeat_time;
 	average_DMA = total_DMA / repeat_time;
+	average_FC = total_FC / repeat_time;
 	average_DMA_out = total_DMA_out / repeat_time;
 	u64 average_cost_time = (average_tick * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 average_DMA_input_time = (average_DMA * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 total_DMA_input_time = (total_DMA * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 average_DMA_output_time = (average_DMA_out * 1000000ULL) / COUNTS_PER_SECOND;
 	u64 total_DMA_output_time = (total_DMA_out * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 average_FC_time = (average_FC * 1000000ULL) / COUNTS_PER_SECOND;
+	u64 total_FC_time = (total_FC * 1000000ULL) / COUNTS_PER_SECOND;
 	printf("Average Cost time : %llu us\n", average_cost_time);
 	printf("DMA multiple : %d \n", DMA_mult );
 	printf("Average DMA_input cost time : %llu us\n", average_DMA_input_time );
 	printf("Total DMA_input cost time : %llu us\n", total_DMA_input_time );
 	printf("Average DMA_output cost time : %llu us\n", average_DMA_output_time );
 	printf("Total DMA_output cost time : %llu us\n", total_DMA_output_time );
+	printf("Average FC cost time : %llu us\n", average_FC_time );
+	printf("Total FC cost time : %llu us\n", total_FC_time );
 	printf("Finish\n");
 	XTime_GetTime(&SW_time_start);
 	//ecg_lstm_and_gru();
