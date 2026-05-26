@@ -13,8 +13,8 @@
 #include "stdlib.h"
 
 #include "xtime_l.h"
-
-#include "weights_gru_64_for_task_step.h"
+#include "weights_gru.h"
+//#include "weights_gru_64_for_task_step.h"
 #include "5class_signal_and_symbol_data_1000.h"
 #include "test_signal.h"
 #include "test_symbol.h"
@@ -39,7 +39,7 @@
 #define IN 32
 #define DIM (T*IN)
 
-#define GRU_H 64
+#define GRU_H 128
 #define LSTM_H 128
 
 #define NUM_CLASSES 5
@@ -922,7 +922,7 @@ int main (void) {
 	srand(10);	// seed
 
 	int repeat_time = 500;
-	int DMA_mult = 1;
+	int DMA_mult = 32;
 	u64 average_tick = 0;
 	u64 average_DMA = 0;
 	u64 total_DMA = 0;
@@ -977,8 +977,8 @@ int main (void) {
 
 
 		for(int j = 0; j < DMA_mult;j++){
-			//MoveDataDMAS32(input, bram_input, 256);
-			MoveDataDMAS32_withGRU(input, bram_input, 256, &gru);
+			MoveDataDMAS32(input, bram_input, 256);
+			//MoveDataDMAS32_withGRU(input, bram_input, 256, &gru);
 		}
 
 		XTime_GetTime(&DMA_time1);
@@ -988,6 +988,7 @@ int main (void) {
 		    if (!gru.done) {
 		        gru_task_step(&gru);
 		    }
+
 
 		}
 		Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000001) ; // rst_sw = 0, data_in = 0, op_st = 1 // operation start
@@ -1014,8 +1015,8 @@ int main (void) {
 		XTime_GetTime(&DMA_time2);
 
 		for(int j = 0; j < DMA_mult;j++){
-			//MoveDataDMAS32(bram_output, output1, 1024);
-			MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
+			MoveDataDMAS32(bram_output, output1, 1024);
+			//MoveDataDMAS32_withGRU(bram_output, output1, 1024, &gru);
 		}
 		XTime_GetTime(&DMA_time3);
 		XTime_GetTime(&SW_time_start);

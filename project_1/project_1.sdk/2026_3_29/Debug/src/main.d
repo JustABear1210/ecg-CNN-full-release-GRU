@@ -24,9 +24,9 @@ src/main.o src/main.o: ../src/main.c \
  ../../2026_3_29_bsp/ps7_cortexa9_0/include/xil_exception.h \
  ../../2026_3_29_bsp/ps7_cortexa9_0/include/xil_printf.h \
  ../../2026_3_29_bsp/ps7_cortexa9_0/include/xtime_l.h \
- ../src/weights_gru_64_for_task_step.h \
- ../src/5class_signal_and_symbol_data_1000.h ../src/test_signal.h \
- ../src/test_symbol.h ../src/fc_params_from_hw_features.h
+ ../src/weights_gru.h ../src/5class_signal_and_symbol_data_1000.h \
+ ../src/test_signal.h ../src/test_symbol.h \
+ ../src/fc_params_from_hw_features.h
 
 ../../2026_3_29_bsp/ps7_cortexa9_0/include/xparameters.h:
 
@@ -78,7 +78,7 @@ src/main.o src/main.o: ../src/main.c \
 
 ../../2026_3_29_bsp/ps7_cortexa9_0/include/xtime_l.h:
 
-../src/weights_gru_64_for_task_step.h:
+../src/weights_gru.h:
 
 ../src/5class_signal_and_symbol_data_1000.h:
 
